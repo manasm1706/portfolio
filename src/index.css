@@ -1,0 +1,126 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  
+  --font-sans: "Geist Sans", "Geist", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+:root {
+  /* Core layout variables from DESIGN.md */
+  --background: #09090B;
+  --foreground: #FFFFFF;
+
+  --card: #111214;
+  --card-foreground: #FFFFFF;
+
+  --popover: #17181B;
+  --popover-foreground: #FFFFFF;
+
+  --border: #24262B;
+  --input: #24262B;
+  --ring: #4F8CFF;
+
+  --primary: #60A5FA;
+  --primary-foreground: #09090B;
+
+  --secondary: #A78BFA;
+  --secondary-foreground: #FFFFFF;
+
+  --success: #4ADE80;
+  --warning: #FBBF24;
+  --danger: #F87171;
+
+  --muted: #17181B;
+  --muted-foreground: #A1A1AA;
+  --text-muted: #71717A;
+
+  --accent: #24262B;
+  --accent-foreground: #FFFFFF;
+
+  --radius: 12px;
+}
+
+/* Base styles and defaults */
+@layer base {
+  body {
+    background-color: var(--background);
+    background-image: 
+      radial-gradient(circle at 15% 15%, rgba(79, 140, 255, 0.05), transparent 45%),
+      radial-gradient(circle at 85% 85%, rgba(139, 92, 246, 0.035), transparent 45%);
+    background-attachment: fixed;
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    margin: 0;
+  }
+
+  /* Accessible visible focus states */
+  *:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  
+  /* Reset focus styles for elements that don't need them */
+  button:focus, a:focus {
+    outline: none;
+  }
+  
+  button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+/* Core layouts and alignment settings */
+html, body, #root {
+  height: 100%;
+  background-color: #09090B;
+}
+
+@utility card-surface-premium {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.015) 0%, rgba(255, 255, 255, 0.005) 100%), #111214;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.02), 0 4px 12px 0 rgba(0, 0, 0, 0.25);
+}
+
+@utility card-surface-elevated-premium {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.025) 0%, rgba(255, 255, 255, 0.01) 100%), #17181B;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.03), 0 8px 24px 0 rgba(0, 0, 0, 0.35);
+}
