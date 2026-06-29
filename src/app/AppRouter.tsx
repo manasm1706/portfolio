@@ -1,5 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom"
 import AppLayout from "@/components/layout/AppLayout"
+import ProtectedRoute from "@/components/layout/ProtectedRoute"
+import LandingPage from "@/features/landing/pages/LandingPage"
 import DashboardPage from "@/features/dashboard/pages/DashboardPage"
 import CalendarPage from "@/features/calendar/pages/CalendarPage"
 import OpportunitiesPage from "@/features/opportunities/pages/OpportunitiesPage"
@@ -11,16 +13,22 @@ import AIPage from "@/features/ai/pages/AIPage"
 import ProfilePage from "@/features/profile/pages/ProfilePage"
 import SettingsPage from "@/features/settings/pages/SettingsPage"
 import DesignSystemPage from "@/features/design-system/pages/DesignSystemPage"
+import { useAuthStore } from "@/store/useAuthStore"
+
+function NavigateToFallback() {
+  const isUnlocked = useAuthStore((state) => state.isUnlocked)
+  return <Navigate to={isUnlocked ? "/dashboard" : "/"} replace />
+}
 
 export default function AppRouter() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* App Shell Wrapper */}
-        <Route element={<AppLayout />}>
-          {/* Route redirect root to dashboard */}
-          <Route path="/" element={<Navigate to="/dashboard" replace />} />
-          
+        {/* Public Route */}
+        <Route path="/" element={<LandingPage />} />
+        
+        {/* Protected App Shell Wrapper */}
+        <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
           {/* Main primary destinations */}
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/calendar" element={<CalendarPage />} />
@@ -33,10 +41,10 @@ export default function AppRouter() {
           <Route path="/profile" element={<ProfilePage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/design-system" element={<DesignSystemPage />} />
-          
-          {/* Wildcard fallback redirection */}
-          <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>
+        
+        {/* Wildcard fallback redirection */}
+        <Route path="*" element={<NavigateToFallback />} />
       </Routes>
     </BrowserRouter>
   )
