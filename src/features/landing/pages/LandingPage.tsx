@@ -196,7 +196,7 @@ export default function LandingPage() {
       {/* 1. Background Fish Swarm Canvas Simulator - constrained to start section */}
       <div className="absolute top-0 left-0 right-0 h-[700px] z-0 overflow-hidden pointer-events-auto">
         <FishSimulation />
-        <div className="absolute inset-0 bg-gradient-to-b from-[#0c0b09]/10 via-[#0c0b09]/60 to-[#0c0b09]" />
+        <div className="absolute inset-0 bg-gradient-to-b from-transparent via-[#0c0b09]/20 to-[#0c0b09]/40" />
       </div>
 
       {/* Header bar */}
@@ -256,14 +256,14 @@ export default function LandingPage() {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 w-full">
           
           <div className="lg:col-span-8 space-y-4 flex flex-col justify-center">
-            {/* Headline section */}
-            <h1 className="font-anton text-7xl sm:text-9xl tracking-tight leading-[0.85] text-cream flex flex-col">
+            {/* Headline section - added typography reef ID and selection/interaction lock */}
+            <h1 id="hero-title-lockup" className="font-anton text-7xl sm:text-9xl tracking-tight leading-[0.85] text-cream flex flex-col select-none pointer-events-none">
               <span>MANAS</span>
               <span>MUNGEKAR</span>
             </h1>
 
             {/* Kinetic rotator word */}
-            <div className="relative overflow-hidden h-[70px] sm:h-[100px] flex items-center justify-start">
+            <div className="relative overflow-hidden h-[70px] sm:h-[100px] flex items-center justify-start select-none pointer-events-none">
               <AnimatePresence mode="wait">
                 <motion.span
                   key={wordIndex}
@@ -281,14 +281,14 @@ export default function LandingPage() {
 
           <div className="lg:col-span-4 flex flex-col justify-between items-start lg:items-end text-left lg:text-right space-y-8 lg:space-y-0 py-4">
             {/* Stat Callout */}
-            <div className="space-y-1">
+            <div className="space-y-1 select-none pointer-events-none">
               <span className="font-space text-[10px] text-text-muted-dark tracking-widest block select-none">// SYSTEM METRIC</span>
               <span className="font-anton text-5xl md:text-6xl text-cream block leading-[1.0]">31 SOLVED</span>
               <span className="font-space text-[9px] text-text-muted-dark uppercase tracking-widest block">// ACTIVE LEETCODE INDEX</span>
             </div>
 
             {/* Short Bio Block */}
-            <div className="max-w-xs space-y-2">
+            <div className="max-w-xs space-y-2 select-none pointer-events-none">
               <span className="font-space text-[10px] text-text-muted-dark tracking-widest block select-none">// WHO I AM</span>
               <p className="font-sans text-xs text-cream/70 leading-relaxed font-jakarta">
                 Computer Engineering student interested in clean abstractions, vector similarity engines, and high-performance developer workspace structures.

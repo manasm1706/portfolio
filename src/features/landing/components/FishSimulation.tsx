@@ -17,11 +17,14 @@ interface Fish {
   perceptionRadius: number
   separationRadius: number
   fear: number
+  panicTimer: number
   alive: boolean
   respawnAt: number
+  fearFactor: number
+  speedFactor: number
 }
 
-type SharkState = "cruise" | "stalk" | "lunge" | "cooldown"
+type SharkState = "cruise" | "stalk" | "lunge" | "cooldown" | "dash"
 
 interface Shark {
   position: Vector2
@@ -35,6 +38,11 @@ interface Shark {
   detectionRadius: number
   lungeTimer: number
   cooldownTimer: number
+  momentum: number
+  fishesEatenCount: number
+  dashTimer: number
+  dashCooldownTimer: number
+  trailPositions: Vector2[]
 }
 
 interface Particle {
@@ -44,6 +52,7 @@ interface Particle {
   vy: number
   alpha: number
   life: number
+  color: string
 }
 
 interface MouseDisturbance {
@@ -54,34 +63,75 @@ interface MouseDisturbance {
   life: number
 }
 
+interface Ripple {
+  x: number
+  y: number
+  spawnAt: number
+  delay: number
+  duration: number
+}
+
 // ─── Tunable Configuration ───────────────────────────────────────────────────
-// All weights and thresholds are in one place so they're easy to dial by eye.
 const SIM_CONFIG = {
-  // Flocking force weights
   separationWeight: 1.8,
   alignmentWeight: 1.0,
   cohesionWeight: 1.0,
   fleeWeight: 2.5,
   wanderWeight: 0.25,
 
-  // Fish base limits
   fishMaxSpeed: 0.8,
   fishPanickedSpeed: 2.0,
   fishMaxForce: 0.04,
 
-  // Fear tuning
-  fearRiseBlend: 0.15,   // how fast fear propagates from neighbors
-  fearDecay: 0.985,      // per-frame multiplier when no high-fear neighbor (spec value)
-  fearThreshold: 0.05,   // below this fear is considered "calm" and not propagated
+  fearRiseBlend: 0.15,
+  fearDecay: 0.985,
+  fearThreshold: 0.05,
 
-  // Spatial grid bucket size (≈ perceptionRadius)
   gridSize: 60,
+
+  fishEdgeMargin: 85,
+  sharkEdgeMargin: 150,
+
+  // ── NEW: Corner repulsion — keeps schools from parking in dead corners ──
+  cornerRepulsionRadius: 220,   // px from each corner where repulsion begins
+  cornerRepulsionWeight: 1.1,   // tune 0.5 (subtle) – 1.5 (strong)
 }
+
+const getCruiseSpeed = (eaten: number) => {
+  if (eaten <= 0) return 0.8
+  if (eaten === 1) return 0.93
+  if (eaten === 2) return 1.06
+  if (eaten === 3) return 1.2
+  if (eaten === 4) return 1.32
+  if (eaten === 5) return 1.45
+  if (eaten === 6) return 1.58
+  return 1.8
+}
+
+const makeCubicBezier = (p1x: number, p1y: number, p2x: number, p2y: number) => {
+  const A = (a1: number, a2: number) => 1.0 - 3.0 * a2 + 3.0 * a1
+  const B = (a1: number, a2: number) => 3.0 * a2 - 6.0 * a1
+  const C = (a1: number) => 3.0 * a1
+  const calcBezier = (t: number, a1: number, a2: number) => ((A(a1, a2) * t + B(a1, a2)) * t + C(a1)) * t
+  const calcSlope = (t: number, a1: number, a2: number) => 3.0 * A(a1, a2) * t * t + 2.0 * B(a1, a2) * t + C(a1)
+  const getTForX = (x: number) => {
+    let t = x
+    for (let i = 0; i < 8; i++) {
+      const xEst = calcBezier(t, p1x, p2x) - x
+      if (Math.abs(xEst) < 1e-6) return t
+      const d = calcSlope(t, p1x, p2x)
+      if (Math.abs(d) < 1e-6) break
+      t -= xEst / d
+    }
+    return t
+  }
+  return (x: number) => calcBezier(getTForX(x), p1y, p2y)
+}
+
+const rippleEase = makeCubicBezier(0.65, 0, 0.34, 1)
 
 export default function FishSimulation() {
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null)
-
-  // All interaction state lives in refs — zero React re-renders from simulation.
   const mouseRef = React.useRef<Vector2>({ x: 0, y: 0 })
   const mouseActiveRef = React.useRef<boolean>(false)
   const clickDisturbanceRef = React.useRef<MouseDisturbance | null>(null)
@@ -89,7 +139,6 @@ export default function FishSimulation() {
   const reducedMotionRef = React.useRef<boolean>(false)
 
   React.useEffect(() => {
-    // Respect prefers-reduced-motion
     const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)")
     reducedMotionRef.current = mediaQuery.matches
     const handleMotionChange = (e: MediaQueryListEvent) => {
@@ -106,17 +155,13 @@ export default function FishSimulation() {
     let width = (canvas.width = canvas.parentElement?.clientWidth ?? window.innerWidth)
     let height = (canvas.height = canvas.parentElement?.clientHeight ?? 650)
 
-    // Load sprites
     const fishImg = new Image()
     fishImg.src = fishIconSrc
     const sharkImg = new Image()
     sharkImg.src = sharkSrc
 
-    // Fish count: desktop 250, mobile 80
     const isMobile = width < 768
     const fishCount = isMobile ? 80 : 250
-
-    // ── Helper math ─────────────────────────────────────────────────────────
 
     const vecDist = (a: Vector2, b: Vector2) => {
       const dx = a.x - b.x
@@ -124,7 +169,6 @@ export default function FishSimulation() {
       return Math.sqrt(dx * dx + dy * dy)
     }
 
-    /** Mutates v in place to enforce a magnitude ceiling. */
     const vecLimit = (v: Vector2, limit: number): void => {
       const mag = Math.sqrt(v.x * v.x + v.y * v.y)
       if (mag > limit && mag > 0) {
@@ -133,10 +177,6 @@ export default function FishSimulation() {
       }
     }
 
-    /**
-     * Compute a Reynolds steering force toward a desired velocity direction.
-     * Returns a new Vector2 already limited to maxForce.
-     */
     const steerToward = (
       dirX: number,
       dirY: number,
@@ -154,23 +194,93 @@ export default function FishSimulation() {
       return desired
     }
 
-    // ── Initialize fish ─────────────────────────────────────────────────────
+    const computeEdgeSteer = (pos: Vector2, margin: number) => {
+      let ix = 0
+      let iy = 0
+      let maxT = 0
+      if (pos.x < margin) {
+        const t = (margin - pos.x) / margin
+        ix += t
+        if (t > maxT) maxT = t
+      } else if (pos.x > width - margin) {
+        const t = (pos.x - (width - margin)) / margin
+        ix -= t
+        if (t > maxT) maxT = t
+      }
+      if (pos.y < margin) {
+        const t = (margin - pos.y) / margin
+        iy += t
+        if (t > maxT) maxT = t
+      } else if (pos.y > height - margin) {
+        const t = (pos.y - (height - margin)) / margin
+        iy -= t
+        if (t > maxT) maxT = t
+      }
+      return { ix, iy, t: Math.min(1, maxT) }
+    }
 
-    const fishList: Fish[] = Array.from({ length: fishCount }, (_, i) => ({
-      id: i,
-      position: { x: Math.random() * width, y: Math.random() * height },
-      velocity: { x: (Math.random() - 0.5) * 1.0, y: (Math.random() - 0.5) * 1.0 },
-      acceleration: { x: 0, y: 0 },
-      maxSpeed: SIM_CONFIG.fishMaxSpeed,
-      maxForce: SIM_CONFIG.fishMaxForce,
-      perceptionRadius: SIM_CONFIG.gridSize,
-      separationRadius: 24,
-      fear: 0,
-      alive: true,
-      respawnAt: 0,
-    }))
+    const applyEdgeTurn = (pos: Vector2, vel: Vector2, margin: number): void => {
+      const edge = computeEdgeSteer(pos, margin)
+      if (edge.t <= 0) return
+      const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y)
+      if (speed < 0.0001) return
+      const inMag = Math.sqrt(edge.ix * edge.ix + edge.iy * edge.iy) || 1
+      const inX = edge.ix / inMag
+      const inY = edge.iy / inMag
+      const curX = vel.x / speed
+      const curY = vel.y / speed
+      const blend = edge.t * edge.t * (3 - 2 * edge.t)
+      const newX = curX * (1 - blend) + inX * blend
+      const newY = curY * (1 - blend) + inY * blend
+      const newMag = Math.sqrt(newX * newX + newY * newY) || 1
+      vel.x = (newX / newMag) * speed
+      vel.y = (newY / newMag) * speed
+    }
 
-    // ── Initialize shark ────────────────────────────────────────────────────
+    // ── NEW: Corner repulsion helper ────────────────────────────────────────
+    // Cheap: 4 sqrt distance checks per fish per frame, no draw cost involved.
+    const computeCornerRepulsion = (pos: Vector2, radius: number) => {
+      const corners = [
+        { x: 0, y: 0 },
+        { x: width, y: 0 },
+        { x: 0, y: height },
+        { x: width, y: height },
+      ]
+      let fx = 0, fy = 0
+      for (const c of corners) {
+        const dx = pos.x - c.x
+        const dy = pos.y - c.y
+        const dist = Math.sqrt(dx * dx + dy * dy)
+        if (dist < radius && dist > 0) {
+          const t = 1 - dist / radius
+          const eased = t * t * (3 - 2 * t) // smoothstep
+          fx += (dx / dist) * eased
+          fy += (dy / dist) * eased
+        }
+      }
+      return { x: fx, y: fy }
+    }
+
+    const fishList: Fish[] = Array.from({ length: fishCount }, (_, i) => {
+      const speedFactor = 0.7 + Math.random() * 0.6
+      const fearFactor = 0.6 + Math.random() * 0.8
+      return {
+        id: i,
+        position: { x: Math.random() * width, y: Math.random() * height },
+        velocity: { x: (Math.random() - 0.5) * 1.0, y: (Math.random() - 0.5) * 1.0 },
+        acceleration: { x: 0, y: 0 },
+        maxSpeed: SIM_CONFIG.fishMaxSpeed * speedFactor,
+        maxForce: SIM_CONFIG.fishMaxForce * (0.85 + speedFactor * 0.15),
+        perceptionRadius: SIM_CONFIG.gridSize,
+        separationRadius: 24,
+        fear: 0,
+        panicTimer: 0,
+        alive: true,
+        respawnAt: 0,
+        fearFactor,
+        speedFactor,
+      }
+    })
 
     const shark: Shark = {
       position: { x: width / 2, y: height / 2 },
@@ -179,16 +289,20 @@ export default function FishSimulation() {
       state: "cruise",
       stateChangedAt: Date.now(),
       targetFishId: null,
-      speed: { cruise: 0.6, stalk: 1.2, lunge: 3.5 },
-      eatRadius: 25,
+      speed: { cruise: 0.8, stalk: 1.2, lunge: 3.5 },
+      eatRadius: 28,
       detectionRadius: 180,
       lungeTimer: 0,
       cooldownTimer: 0,
+      momentum: 0.1,
+      fishesEatenCount: 0,
+      dashTimer: 0,
+      dashCooldownTimer: 0,
+      trailPositions: [],
     }
 
     let particlesList: Particle[] = []
-
-    // ── Event handlers ──────────────────────────────────────────────────────
+    let ripplesList: Ripple[] = []
 
     const handleResize = () => {
       width = canvas.width = canvas.parentElement?.clientWidth ?? window.innerWidth
@@ -204,28 +318,38 @@ export default function FishSimulation() {
 
     const handleCanvasClick = (e: MouseEvent) => {
       const rect = canvas.getBoundingClientRect()
-      const padding = 30
-      const clickX = Math.max(padding, Math.min(width - padding, e.clientX - rect.left))
-      const clickY = Math.max(padding, Math.min(height - padding, e.clientY - rect.top))
+      const clickX = e.clientX - rect.left
+      const clickY = e.clientY - rect.top
 
-      // Expanding-ring disturbance
+      const safeX = Math.max(50, Math.min(width - 50, clickX))
+      const safeY = Math.max(50, Math.min(height - 50, clickY))
+
+      const spawnAt = Date.now()
+      for (let k = 0; k < 2; k++) {
+        ripplesList.push({
+          x: clickX,
+          y: clickY,
+          spawnAt,
+          delay: k * 500,
+          duration: 3000,
+        })
+      }
+
       clickDisturbanceRef.current = {
-        position: { x: clickX, y: clickY },
+        position: { x: safeX, y: safeY },
         radius: 12,
         active: true,
         strength: 1.0,
         life: 1.0,
       }
-      // Lure shark toward click
-      clickTargetRef.current = { x: clickX, y: clickY }
+
+      clickTargetRef.current = { x: safeX, y: safeY }
     }
 
     window.addEventListener("resize", handleResize)
     window.addEventListener("mousemove", handleMouseMove)
     document.addEventListener("mouseleave", handleMouseLeave)
     canvas.addEventListener("click", handleCanvasClick)
-
-    // ── Spatial hash helpers ────────────────────────────────────────────────
 
     type SpatialGrid = Map<string, Fish[]>
 
@@ -256,90 +380,113 @@ export default function FishSimulation() {
       return result
     }
 
-    // ── Shark helpers ────────────────────────────────────────────────────────
-
-    /** Soft boundary steering — curves the shark away from edges instead of hard-stopping. */
-    const sharkBoundaryForce = (): Vector2 => {
-      const margin = 60
-      const strength = 0.08
-      let fx = 0, fy = 0
-      if (shark.position.x < margin)        fx += strength * (margin - shark.position.x)
-      if (shark.position.x > width - margin) fx -= strength * (shark.position.x - (width - margin))
-      if (shark.position.y < margin)        fy += strength * (margin - shark.position.y)
-      if (shark.position.y > height - margin) fy -= strength * (shark.position.y - (height - margin))
-      return { x: fx, y: fy }
-    }
-
-    // ── Main RAF loop ────────────────────────────────────────────────────────
-
     const loop = () => {
       const now = Date.now()
       ctx.clearRect(0, 0, width, height)
 
-      // ── 1. Click disturbance ring ──────────────────────────────────────
+      ripplesList = ripplesList.filter((ripple) => {
+        const elapsed = now - ripple.spawnAt - ripple.delay
+        if (elapsed < 0) return true
+
+        const progress = elapsed / ripple.duration
+        if (progress >= 1) return false
+
+        const eased = rippleEase(progress)
+        const baseRadius = 75
+        const radius = baseRadius * (0.75 + eased * 0.75)
+        const alpha = (1 - eased) * 0.22
+
+        ctx.save()
+        ctx.beginPath()
+        ctx.arc(ripple.x, ripple.y, radius, 0, Math.PI * 2)
+
+        ctx.shadowBlur = 8
+        ctx.shadowColor = "rgba(233, 221, 185, 0.3)"
+
+        ctx.strokeStyle = `rgba(233, 221, 185, ${alpha})`
+        ctx.lineWidth = 6
+        ctx.stroke()
+        ctx.restore()
+        return true
+      })
+
       if (clickDisturbanceRef.current) {
         const dist = clickDisturbanceRef.current
         dist.radius += 4
         dist.life -= 0.025
         dist.strength = dist.life
-
-        if (dist.life <= 0) {
-          clickDisturbanceRef.current = null
-        } else {
-          ctx.beginPath()
-          ctx.arc(dist.position.x, dist.position.y, dist.radius, 0, Math.PI * 2)
-          ctx.strokeStyle = `rgba(233, 221, 185, ${dist.life * 0.2})`
-          ctx.lineWidth = 2.0
-          ctx.stroke()
-        }
+        if (dist.life <= 0) clickDisturbanceRef.current = null
       }
 
-      // ── 2. Build spatial grid once per frame ───────────────────────────
       const grid = buildGrid()
 
-      // ── 3. Fish update ─────────────────────────────────────────────────
+      const titleEl = document.getElementById("hero-title-lockup")
+      let reefCenter = { x: width / 2, y: height * 0.4 }
+      let reefRadiusX = 185
+      let reefRadiusY = 90
+      if (titleEl && canvas) {
+        const rect = titleEl.getBoundingClientRect()
+        const canvasRect = canvas.getBoundingClientRect()
+        reefCenter = {
+          x: rect.left - canvasRect.left + rect.width / 2,
+          y: rect.top - canvasRect.top + rect.height / 2
+        }
+        reefRadiusX = rect.width / 2 + 30
+        reefRadiusY = rect.height / 2 + 30
+      }
+
       for (const fish of fishList) {
 
-        // Handle dead fish: respawn check
+        const dToShark = vecDist(fish.position, shark.position)
+        if (fish.alive && dToShark < shark.eatRadius) {
+          fish.alive = false
+          fish.respawnAt = now + 30000 + Math.random() * 30000
+
+          shark.fishesEatenCount++
+          shark.momentum = Math.min(1.0, shark.momentum + 0.15)
+
+          for (let k = 0; k < 10; k++) {
+            const angle = Math.random() * Math.PI * 2
+            const speed = 0.6 + Math.random() * 1.8
+            particlesList.push({
+              x: fish.position.x,
+              y: fish.position.y,
+              vx: Math.cos(angle) * speed,
+              vy: Math.sin(angle) * speed,
+              alpha: 1.0,
+              life: 1.0,
+              color: k % 2 === 0 ? "rgba(191, 59, 42," : "rgba(233, 221, 185,"
+            })
+          }
+        }
+
         if (!fish.alive) {
           if (now >= fish.respawnAt) {
-            const edge = Math.floor(Math.random() * 4)
-            let rx = 0, ry = 0
-            if (edge === 0)      { rx = -20;        ry = Math.random() * height }
-            else if (edge === 1) { rx = width + 20; ry = Math.random() * height }
-            else if (edge === 2) { rx = Math.random() * width; ry = -20 }
-            else                 { rx = Math.random() * width; ry = height + 20 }
-
-            const cx = width / 2 - rx
-            const cy = height / 2 - ry
-            const cmag = Math.sqrt(cx * cx + cy * cy)
+            const rx = reefCenter.x + (Math.random() - 0.5) * reefRadiusX * 1.5
+            const ry = reefCenter.y + (Math.random() - 0.5) * reefRadiusY * 1.5
+            
             fish.position = { x: rx, y: ry }
-            fish.velocity = { x: (cx / cmag) * 0.6, y: (cy / cmag) * 0.6 }
+            fish.velocity = { x: (Math.random() - 0.5) * 1.0, y: (Math.random() - 0.5) * 1.0 }
             fish.acceleration = { x: 0, y: 0 }
-            fish.fear = 0.6   // spec: "re-enters a little rattled"
+            fish.fear = 0.5
+            fish.panicTimer = 0
             fish.alive = true
           }
           continue
         }
 
-        // Reduced-motion: calm drift only
         if (reducedMotionRef.current) {
           fish.velocity.x += (Math.random() - 0.5) * 0.02
           fish.velocity.y += (Math.random() - 0.5) * 0.02
-          vecLimit(fish.velocity, 0.2)
+          vecLimit(fish.velocity, 0.2 * fish.speedFactor)
+          applyEdgeTurn(fish.position, fish.velocity, SIM_CONFIG.fishEdgeMargin)
           fish.position.x += fish.velocity.x
           fish.position.y += fish.velocity.y
-          if (fish.position.x < -15) fish.position.x = width + 15
-          if (fish.position.x > width + 15) fish.position.x = -15
-          if (fish.position.y < -15) fish.position.y = height + 15
-          if (fish.position.y > height + 15) fish.position.y = -15
           continue
         }
 
-        // ── Collect neighbor stats from spatial grid ──
         const neighbors = queryNeighbors(grid, fish.position)
 
-        // FIX: accumulate raw sums first, normalize after — don't normalize before dividing by count.
         let rawSepX = 0, rawSepY = 0, sepCount = 0
         let sumVelX = 0, sumVelY = 0
         let sumPosX = 0, sumPosY = 0, peerCount = 0
@@ -350,7 +497,6 @@ export default function FishSimulation() {
           const d = vecDist(fish.position, other.position)
 
           if (d < fish.separationRadius && d > 0) {
-            // Accumulate raw inverse-distance difference vectors
             rawSepX += (fish.position.x - other.position.x) / d
             rawSepY += (fish.position.y - other.position.y) / d
             sepCount++
@@ -366,102 +512,87 @@ export default function FishSimulation() {
           }
         }
 
-        // ── Fear update ──
-        // FIX: fear ALWAYS decays every frame; propagation and direct detection can raise it.
         const distToShark = vecDist(fish.position, shark.position)
-        if (distToShark < shark.detectionRadius) {
-          fish.fear = 1.0
+        const activeDetectionRadius = shark.state === "dash" ? shark.detectionRadius * 2.0 : shark.detectionRadius
+        if (distToShark < activeDetectionRadius) {
+          fish.fear = Math.min(1, fish.fearFactor)
+          fish.panicTimer = Math.round(150 * fish.fearFactor)
         } else {
-          // Propagate from scared neighbors
-          if (maxNeighborFear > SIM_CONFIG.fearThreshold) {
-            fish.fear += (maxNeighborFear - fish.fear) * SIM_CONFIG.fearRiseBlend
+          if (fish.panicTimer > 0) {
+            fish.panicTimer--
+            fish.fear = Math.max(0.4 * fish.fearFactor, fish.fear * 0.99)
+          } else {
+            if (maxNeighborFear > SIM_CONFIG.fearThreshold) {
+              fish.fear += (maxNeighborFear - fish.fear) * SIM_CONFIG.fearRiseBlend * fish.fearFactor
+            }
+            fish.fear *= SIM_CONFIG.fearDecay
           }
-          // Always decay — spec: "fear *= 0.985 per frame"
-          fish.fear *= SIM_CONFIG.fearDecay
         }
         fish.fear = Math.max(0, Math.min(1, fish.fear))
 
-        // ── Separation steering ──
-        // FIX: average the raw sum BEFORE computing the steering force.
-        let sepForce: Vector2 = { x: 0, y: 0 }
+        if (clickDisturbanceRef.current) {
+          const d = vecDist(fish.position, clickDisturbanceRef.current.position)
+          if (d < 120) {
+            fish.fear = Math.max(fish.fear, clickDisturbanceRef.current.strength * fish.fearFactor)
+          }
+        }
+
+        let sepForce = { x: 0, y: 0 }
         if (sepCount > 0) {
-          sepForce = steerToward(
-            rawSepX / sepCount,
-            rawSepY / sepCount,
-            fish.velocity,
-            fish.maxSpeed,
-            fish.maxForce
-          )
+          sepForce = steerToward(rawSepX / sepCount, rawSepY / sepCount, fish.velocity, fish.maxSpeed, fish.maxForce)
         }
 
-        // ── Alignment steering ──
-        let aliForce: Vector2 = { x: 0, y: 0 }
+        let aliForce = { x: 0, y: 0 }
         if (peerCount > 0) {
-          aliForce = steerToward(
-            sumVelX / peerCount,
-            sumVelY / peerCount,
-            fish.velocity,
-            fish.maxSpeed,
-            fish.maxForce
-          )
+          aliForce = steerToward(sumVelX / peerCount, sumVelY / peerCount, fish.velocity, fish.maxSpeed, fish.maxForce)
         }
 
-        // ── Cohesion steering ──
-        let cohForce: Vector2 = { x: 0, y: 0 }
+        let cohForce = { x: 0, y: 0 }
         if (peerCount > 0) {
-          cohForce = steerToward(
-            (sumPosX / peerCount) - fish.position.x,
-            (sumPosY / peerCount) - fish.position.y,
-            fish.velocity,
-            fish.maxSpeed,
-            fish.maxForce
-          )
+          cohForce = steerToward((sumPosX / peerCount) - fish.position.x, (sumPosY / peerCount) - fish.position.y, fish.velocity, fish.maxSpeed, fish.maxForce)
         }
 
-        // ── Flee steering (shark + click disturbance) ──
-        // FIX: flee from shark and flee from click are separate; both are properly limited.
-        let fleeForce: Vector2 = { x: 0, y: 0 }
-
+        let fleeForce = { x: 0, y: 0 }
         if (fish.fear > SIM_CONFIG.fearThreshold) {
           const escapeX = fish.position.x - shark.position.x
           const escapeY = fish.position.y - shark.position.y
-          const sharkFlee = steerToward(escapeX, escapeY, fish.velocity, SIM_CONFIG.fishPanickedSpeed, fish.maxForce * 1.5)
-          fleeForce.x += sharkFlee.x
-          fleeForce.y += sharkFlee.y
+          fleeForce = steerToward(escapeX, escapeY, fish.velocity, SIM_CONFIG.fishPanickedSpeed * fish.speedFactor, fish.maxForce * 1.5)
         }
 
         if (clickDisturbanceRef.current) {
           const d = vecDist(fish.position, clickDisturbanceRef.current.position)
           if (d < 120) {
-            fish.fear = Math.max(fish.fear, clickDisturbanceRef.current.strength)
             const clickFlee = steerToward(
               fish.position.x - clickDisturbanceRef.current.position.x,
               fish.position.y - clickDisturbanceRef.current.position.y,
               fish.velocity,
-              SIM_CONFIG.fishPanickedSpeed,
+              SIM_CONFIG.fishPanickedSpeed * fish.speedFactor,
               fish.maxForce * 1.5
             )
             fleeForce.x += clickFlee.x
             fleeForce.y += clickFlee.y
           }
         }
-
-        // FIX: limit the combined flee force to a ceiling before weighting
         vecLimit(fleeForce, fish.maxForce * 1.5)
 
-        // ── Wander (random drift) ──
-        // FIX: wander force is computed as a small steering force, NOT added after the acceleration
-        //      limit — so it participates in the total cap correctly.
+        const reefAttractX = reefCenter.x - fish.position.x
+        const reefAttractY = reefCenter.y - fish.position.y
+        const reefForce = steerToward(reefAttractX, reefAttractY, fish.velocity, fish.maxSpeed * 0.35, fish.maxForce * 0.12)
+
+        // ── NEW: Corner repulsion force — doesn't affect shark, doesn't touch reef/flee/schooling ──
+        const rawCorner = computeCornerRepulsion(fish.position, SIM_CONFIG.cornerRepulsionRadius)
+        const cornerForce = steerToward(rawCorner.x, rawCorner.y, fish.velocity, fish.maxSpeed, fish.maxForce)
+
         const wanderX = (Math.random() - 0.5) * SIM_CONFIG.wanderWeight
         const wanderY = (Math.random() - 0.5) * SIM_CONFIG.wanderWeight
 
-        // ── Combine all forces, then apply one cap ──
-        // FIX: sum weighted components THEN apply the single acceleration cap — not cap then weight.
         fish.acceleration.x =
           sepForce.x * SIM_CONFIG.separationWeight +
           aliForce.x * SIM_CONFIG.alignmentWeight +
           cohForce.x * SIM_CONFIG.cohesionWeight +
           fleeForce.x * SIM_CONFIG.fleeWeight +
+          reefForce.x * 0.35 +
+          cornerForce.x * SIM_CONFIG.cornerRepulsionWeight +
           wanderX
 
         fish.acceleration.y =
@@ -469,55 +600,104 @@ export default function FishSimulation() {
           aliForce.y * SIM_CONFIG.alignmentWeight +
           cohForce.y * SIM_CONFIG.cohesionWeight +
           fleeForce.y * SIM_CONFIG.fleeWeight +
+          reefForce.y * 0.35 +
+          cornerForce.y * SIM_CONFIG.cornerRepulsionWeight +
           wanderY
 
-        // Cap total steering
-        vecLimit(fish.acceleration, fish.maxForce * 3)
+        vecLimit(fish.acceleration, fish.maxForce * 2.5)
 
         fish.velocity.x += fish.acceleration.x
         fish.velocity.y += fish.acceleration.y
 
-        // Dynamic top speed: calm → maxSpeed, panicked → panickedSpeed
-        const dynamicMaxSpeed =
-          SIM_CONFIG.fishMaxSpeed +
-          (SIM_CONFIG.fishPanickedSpeed - SIM_CONFIG.fishMaxSpeed) * fish.fear
+        const dynamicMaxSpeed = fish.maxSpeed + (SIM_CONFIG.fishPanickedSpeed * fish.speedFactor - fish.maxSpeed) * fish.fear
         vecLimit(fish.velocity, dynamicMaxSpeed)
+
+        applyEdgeTurn(fish.position, fish.velocity, SIM_CONFIG.fishEdgeMargin)
 
         fish.position.x += fish.velocity.x
         fish.position.y += fish.velocity.y
-
-        // Reset accumulator
         fish.acceleration = { x: 0, y: 0 }
 
-        // Wrap boundaries
-        if (fish.position.x < -20) fish.position.x = width + 20
-        if (fish.position.x > width + 20) fish.position.x = -20
-        if (fish.position.y < -20) fish.position.y = height + 20
-        if (fish.position.y > height + 20) fish.position.y = -20
+        if (fish.position.x < -5) fish.position.x = -5
+        if (fish.position.x > width + 5) fish.position.x = width + 5
+        if (fish.position.y < -5) fish.position.y = -5
+        if (fish.position.y > height + 5) fish.position.y = height + 5
       }
 
-      // ── 4. Shark AI ─────────────────────────────────────────────────────
       if (reducedMotionRef.current) {
-        // Calm drift only — spec: "freeze shark in cruise at very low speed"
         shark.heading += (Math.random() - 0.5) * 0.02
         shark.velocity = { x: Math.cos(shark.heading) * 0.3, y: Math.sin(shark.heading) * 0.3 }
+        applyEdgeTurn(shark.position, shark.velocity, SIM_CONFIG.sharkEdgeMargin)
+        shark.heading = Math.atan2(shark.velocity.y, shark.velocity.x)
         shark.position.x += shark.velocity.x
         shark.position.y += shark.velocity.y
       } else {
-        // Click target override (user-driven lure)
+        
+        if (shark.dashCooldownTimer > 0) {
+          shark.dashCooldownTimer--
+        }
+
+        if (shark.state === "dash") {
+          shark.momentum = Math.min(1.0, shark.momentum + 0.005)
+        } else if (shark.state !== "cooldown") {
+          shark.momentum = Math.min(1.0, shark.momentum + 0.0006)
+        } else {
+          shark.momentum = Math.max(0.1, shark.momentum - 0.004)
+        }
+
+        const baseCruiseSpeed = getCruiseSpeed(shark.fishesEatenCount)
+        const baseStalkSpeed = baseCruiseSpeed * 1.5
+        const baseLungeSpeed = baseCruiseSpeed * 4.0
+
+        if (shark.state !== "dash" && shark.state !== "cooldown" && shark.momentum > 0.7 && shark.dashCooldownTimer <= 0) {
+          if (shark.state === "lunge" || shark.state === "stalk" || clickTargetRef.current) {
+            shark.state = "dash"
+            shark.stateChangedAt = now
+            shark.dashTimer = 45 + Math.floor(Math.random() * 20)
+          }
+        }
+
         if (clickTargetRef.current) {
           const dx = clickTargetRef.current.x - shark.position.x
           const dy = clickTargetRef.current.y - shark.position.y
           const dist = Math.sqrt(dx * dx + dy * dy)
-          if (dist > 15) {
-            const s = shark.speed.lunge
-            shark.velocity = { x: (dx / dist) * s, y: (dy / dist) * s }
+
+          if (dist > 18) {
+            const currentSpeed = shark.state === "dash" ? baseLungeSpeed * 2.5 : baseLungeSpeed
+            shark.velocity = {
+              x: (dx / dist) * currentSpeed,
+              y: (dy / dist) * currentSpeed,
+            }
             shark.heading = Math.atan2(dy, dx)
           } else {
             clickTargetRef.current = null
           }
-        } else {
-          // Find fish cluster inside detectionRadius
+        } 
+        
+        else if (shark.state === "dash") {
+          const targetFish = shark.targetFishId !== null ? fishList[shark.targetFishId] : null
+          if (targetFish && targetFish.alive) {
+            const dx = targetFish.position.x - shark.position.x
+            const dy = targetFish.position.y - shark.position.y
+            const dist = Math.sqrt(dx * dx + dy * dy)
+            if (dist > 0) {
+              const dashSpeed = baseLungeSpeed * 2.5
+              shark.velocity = { x: (dx / dist) * dashSpeed, y: (dy / dist) * dashSpeed }
+              shark.heading = Math.atan2(dy, dx)
+            }
+          }
+
+          shark.dashTimer--
+          if (shark.dashTimer <= 0) {
+            shark.state = "cooldown"
+            shark.stateChangedAt = now
+            shark.cooldownTimer = 180
+            shark.dashCooldownTimer = 300
+            shark.momentum = 0.2
+          }
+        }
+        
+        else {
           let denseCentroidX = 0, denseCentroidY = 0, densityCount = 0
           for (const fish of fishList) {
             if (!fish.alive) continue
@@ -532,37 +712,17 @@ export default function FishSimulation() {
             denseCentroidY /= densityCount
           }
 
-          // ── State machine ──
           if (shark.state === "cruise") {
             shark.heading += (Math.random() - 0.5) * 0.1
-
-            // Cursor lure: small attraction blend (spec §5.3)
-            if (mouseActiveRef.current) {
-              const dx = mouseRef.current.x - shark.position.x
-              const dy = mouseRef.current.y - shark.position.y
-              const dist = Math.sqrt(dx * dx + dy * dy)
-              if (dist > 40) {
-                shark.velocity.x += (dx / dist) * 0.2
-                shark.velocity.y += (dy / dist) * 0.2
-              }
-            }
-
-            const s = shark.speed.cruise
-            const mag = Math.sqrt(shark.velocity.x ** 2 + shark.velocity.y ** 2)
-            if (mag > 0) {
-              shark.velocity.x = (shark.velocity.x / mag) * s
-              shark.velocity.y = (shark.velocity.y / mag) * s
-              shark.heading = Math.atan2(shark.velocity.y, shark.velocity.x)
-            } else {
-              shark.velocity = { x: Math.cos(shark.heading) * s, y: Math.sin(shark.heading) * s }
-            }
+            shark.velocity.x = Math.cos(shark.heading) * baseCruiseSpeed
+            shark.velocity.y = Math.sin(shark.heading) * baseCruiseSpeed
 
             if (densityCount >= 5 && now - shark.stateChangedAt > 3000) {
               shark.state = "stalk"
               shark.stateChangedAt = now
             }
-          }
-
+          } 
+          
           else if (shark.state === "stalk") {
             if (densityCount === 0) {
               shark.state = "cruise"
@@ -571,17 +731,13 @@ export default function FishSimulation() {
               const dx = denseCentroidX - shark.position.x
               const dy = denseCentroidY - shark.position.y
               const dist = Math.sqrt(dx * dx + dy * dy)
+              
               if (dist > 10) {
-                shark.velocity = {
-                  x: (dx / dist) * shark.speed.stalk,
-                  y: (dy / dist) * shark.speed.stalk,
-                }
+                shark.velocity = { x: (dx / dist) * baseStalkSpeed, y: (dy / dist) * baseStalkSpeed }
                 shark.heading = Math.atan2(dy, dx)
               }
 
-              // Transition to lunge when close enough
               if (dist < 90) {
-                // FIX: only scan fish already within detectionRadius (not the whole array)
                 let minDist = Infinity, chosenId: number | null = null
                 for (const fish of fishList) {
                   if (!fish.alive) continue
@@ -595,53 +751,23 @@ export default function FishSimulation() {
                   shark.state = "lunge"
                   shark.targetFishId = chosenId
                   shark.stateChangedAt = now
-                  shark.lungeTimer = 75 // frames (~1.25 s at 60fps)
+                  shark.lungeTimer = 75
                 }
               }
             }
-          }
-
+          } 
+          
           else if (shark.state === "lunge") {
             const targetFish = shark.targetFishId !== null ? fishList[shark.targetFishId] : null
-
             if (targetFish && targetFish.alive) {
               const dx = targetFish.position.x - shark.position.x
               const dy = targetFish.position.y - shark.position.y
               const dist = Math.sqrt(dx * dx + dy * dy)
               if (dist > 0) {
-                shark.velocity = {
-                  x: (dx / dist) * shark.speed.lunge,
-                  y: (dy / dist) * shark.speed.lunge,
-                }
+                shark.velocity = { x: (dx / dist) * baseLungeSpeed, y: (dy / dist) * baseLungeSpeed }
                 shark.heading = Math.atan2(dy, dx)
               }
-
-              // Eat check
-              if (dist < shark.eatRadius) {
-                targetFish.alive = false
-                targetFish.respawnAt = now + 1800 + Math.random() * 800
-
-                // Particle burst
-                for (let k = 0; k < 12; k++) {
-                  const angle = Math.random() * Math.PI * 2
-                  const speed = 0.5 + Math.random() * 2.0
-                  particlesList.push({
-                    x: targetFish.position.x,
-                    y: targetFish.position.y,
-                    vx: Math.cos(angle) * speed,
-                    vy: Math.sin(angle) * speed,
-                    alpha: 1.0,
-                    life: 1.0,
-                  })
-                }
-
-                shark.state = "cooldown"
-                shark.targetFishId = null
-                shark.stateChangedAt = now
-                shark.cooldownTimer = 200
-              }
             } else {
-              // Target died or disappeared — abort lunge
               shark.state = "cruise"
               shark.targetFishId = null
               shark.stateChangedAt = now
@@ -654,14 +780,15 @@ export default function FishSimulation() {
               shark.stateChangedAt = now
               shark.cooldownTimer = 180
             }
-          }
-
+          } 
+          
           else if (shark.state === "cooldown") {
             shark.heading += (Math.random() - 0.5) * 0.05
             shark.velocity = {
-              x: Math.cos(shark.heading) * shark.speed.cruise,
-              y: Math.sin(shark.heading) * shark.speed.cruise,
+              x: Math.cos(shark.heading) * baseCruiseSpeed,
+              y: Math.sin(shark.heading) * baseCruiseSpeed,
             }
+
             shark.cooldownTimer--
             if (shark.cooldownTimer <= 0) {
               shark.state = "cruise"
@@ -670,37 +797,49 @@ export default function FishSimulation() {
           }
         }
 
-        // FIX: soft boundary steering instead of hard wall bounce
-        const boundary = sharkBoundaryForce()
-        shark.velocity.x += boundary.x
-        shark.velocity.y += boundary.y
+        applyEdgeTurn(shark.position, shark.velocity, SIM_CONFIG.sharkEdgeMargin)
+        if (shark.velocity.x !== 0 || shark.velocity.y !== 0) {
+          shark.heading = Math.atan2(shark.velocity.y, shark.velocity.x)
+        }
 
-        // Cap shark at its current mode speed (boundary force shouldn't break lunge speed)
-        const sharkMaxSpeed =
-          shark.state === "lunge"    ? shark.speed.lunge  :
-          shark.state === "stalk"    ? shark.speed.stalk  :
-          shark.speed.cruise
+        const currentCap = shark.state === "dash" ? baseLungeSpeed * 2.5 :
+                           shark.state === "lunge" ? baseLungeSpeed :
+                           shark.state === "stalk" ? baseStalkSpeed : baseCruiseSpeed
 
-        vecLimit(shark.velocity, sharkMaxSpeed * 1.1)
+        vecLimit(shark.velocity, currentCap * 1.1)
+
         shark.position.x += shark.velocity.x
         shark.position.y += shark.velocity.y
+
+        shark.position.x = Math.max(-40, Math.min(width + 40, shark.position.x))
+        shark.position.y = Math.max(-40, Math.min(height + 40, shark.position.y))
+
+        if (shark.state === "dash") {
+          shark.trailPositions.push({ x: shark.position.x, y: shark.position.y })
+          if (shark.trailPositions.length > 8) {
+            shark.trailPositions.shift()
+          }
+        } else {
+          if (shark.trailPositions.length > 0) {
+            shark.trailPositions.shift()
+          }
+        }
       }
 
-      // ── 5. Particles ────────────────────────────────────────────────────
       particlesList = particlesList.filter((p) => {
         p.x += p.vx
         p.y += p.vy
-        p.alpha -= 0.018
-        p.life  -= 0.018
+        p.alpha -= 0.042
+        p.life -= 0.042
         if (p.alpha <= 0) return false
+
         ctx.beginPath()
-        ctx.arc(p.x, p.y, 3.0, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(191, 59, 42, ${p.alpha * 0.85})`
+        ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2)
+        ctx.fillStyle = `${p.color} ${p.alpha})`
         ctx.fill()
         return true
       })
 
-      // ── 6. Draw fish ─────────────────────────────────────────────────────
       for (const fish of fishList) {
         if (!fish.alive) continue
         const angle = Math.atan2(fish.velocity.y, fish.velocity.x)
@@ -709,7 +848,6 @@ export default function FishSimulation() {
         ctx.translate(fish.position.x, fish.position.y)
         ctx.rotate(angle)
 
-        // Yellow glow matching the cream shade of the portfolio design
         ctx.shadowBlur = 8 + fish.fear * 6
         ctx.shadowColor = "rgba(233, 221, 185, 0.6)"
 
@@ -717,7 +855,6 @@ export default function FishSimulation() {
           ctx.globalAlpha = Math.min(1.0, 0.65 + fish.fear * 0.35)
           ctx.drawImage(fishImg, -14, -14, 28, 28)
         } else {
-          // Fallback chevron
           ctx.beginPath()
           ctx.moveTo(8, 0)
           ctx.lineTo(-6, -5)
@@ -735,33 +872,50 @@ export default function FishSimulation() {
         ctx.restore()
       }
 
-      // ── 7. Draw shark ────────────────────────────────────────────────────
+      if (shark.state === "dash" && sharkImg.complete && sharkImg.naturalWidth !== 0) {
+        for (let k = 0; k < shark.trailPositions.length; k++) {
+          const pos = shark.trailPositions[k]
+          const alpha = (k / shark.trailPositions.length) * 0.22
+          ctx.save()
+          ctx.translate(pos.x, pos.y)
+          ctx.rotate(shark.heading)
+          ctx.globalAlpha = alpha
+          
+          ctx.shadowBlur = 38
+          ctx.shadowColor = "rgba(191, 59, 42, 1.0)"
+          
+          ctx.drawImage(sharkImg, -44, -44, 88, 88)
+          ctx.restore()
+        }
+      }
+
       ctx.save()
       ctx.translate(shark.position.x, shark.position.y)
       ctx.rotate(shark.heading)
 
-      // Reddish glow matching the accent red color of the portfolio design
-      ctx.shadowBlur = shark.state === "lunge" ? 22 : shark.state === "stalk" ? 15 : 10
-      ctx.shadowColor = "rgba(191, 59, 42, 0.85)"
+      ctx.shadowBlur = shark.state === "dash" ? 38 :
+                       shark.state === "lunge" ? 24 :
+                       shark.state === "stalk" ? 18 : 10
+      ctx.shadowColor = "rgba(191, 59, 42, 1.0)"
 
       if (sharkImg.complete && sharkImg.naturalWidth !== 0) {
         ctx.globalAlpha =
+          shark.state === "dash" ? 1.0 :
           shark.state === "lunge" ? 0.95 :
           shark.state === "stalk" ? 0.85 : 0.75
-        ctx.drawImage(sharkImg, -30, -30, 60, 60)
+        ctx.drawImage(sharkImg, -44, -44, 88, 88)
       } else {
-        // Fallback dart
         ctx.beginPath()
         ctx.moveTo(25, 0)
         ctx.lineTo(-16, -10)
         ctx.lineTo(-10, 0)
         ctx.lineTo(-16, 10)
         ctx.closePath()
-        if (shark.state === "lunge") {
-          ctx.fillStyle   = "rgba(191, 59, 42, 0.85)"
+        if (shark.state === "dash" || shark.state === "lunge") {
+          ctx.fillStyle   = "rgba(191, 59, 42, 0.95)"
           ctx.strokeStyle = "rgba(191, 59, 42, 1.0)"
         } else if (shark.state === "stalk") {
-          ctx.fillStyle   = "rgba(191, 59, 42, 0.65)"
+          ctx.fillStyle   = "rgba(191, 59, 42, 0.7)"
           ctx.strokeStyle = "rgba(191, 59, 42, 0.95)"
         } else {
           ctx.fillStyle   = "rgba(191, 59, 42, 0.5)"
